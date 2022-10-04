@@ -23,6 +23,7 @@ ldap:
         userMatchAttribute:             "uid"
         userNameAttribute:              "cn"
         userEmailAttribute:             "mail"
+        userLdapAdminAttribute:         "jcLdapAdmin"
 
         groupDn:                        ~
         groupFilter:                    "(objectClass=groupOfUniqueNames)"
