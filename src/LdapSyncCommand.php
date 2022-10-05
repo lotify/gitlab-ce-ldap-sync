@@ -1021,6 +1021,10 @@ class LdapSyncCommand extends Command
                 continue;
             }
 
+            if (isset($gitlabUser["state"]) && $gitlabUser["state"] == "blocked") {
+                continue;
+            }
+
             $this->logger->warning(sprintf("Disabling Gitlab user #%d \"%s\".", $gitlabUserId, $gitlabUserName));
 
             !$this->dryRun ? ($gitlab->users()->block($gitlabUserId)) : $this->logger->warning(
@@ -1060,12 +1064,13 @@ class LdapSyncCommand extends Command
                 continue;
             }
 
-            if ($gitlab->users()->all(["username" => $gitlabUserName, "blocked" => true])) {
+            if (isset($ldapUsers[$gitlabUserName]) && isset($gitlabUser["state"]) && $gitlabUser["state"] == "blocked") {
                 $this->logger->info(sprintf("Enabling Gitlab user #%d \"%s\".", $gitlabUserId, $gitlabUserName));
                 !$this->dryRun ? ($gitlab->users()->unblock($gitlabUserId)) : $this->logger->warning(
                     "Operation skipped due to dry run."
                 );
             }
+
 
             $this->update_user($gitlabUser, $ldapUsers, $gitlab, $gitlabConfig["ldapServerName"]);
 
@@ -1983,7 +1988,9 @@ class LdapSyncCommand extends Command
         if ($gitlabUser["keys"] && count($gitlabUser["keys"]) > 0) {
             foreach ($gitlabUser["keys"] as $sshKey) {
                 //check if key already exists
-                if (!is_array($ldapUserDetails["sshKeys"]) || count($ldapUserDetails["sshKeys"]) < 1 || !$this->recursive_find_pair(
+                if (!is_array($ldapUserDetails["sshKeys"]) || count(
+                        $ldapUserDetails["sshKeys"]
+                    ) < 1 || !$this->recursive_find_pair(
                         ["fingerprint" => $sshKey["fingerprint"]],
                         $ldapUserDetails["sshKeys"]
                     )) {
