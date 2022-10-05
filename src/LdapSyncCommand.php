@@ -1374,10 +1374,7 @@ class LdapSyncCommand extends Command
         asort($usersToSyncMembership);
         $groupsToSyncMembership = ($groupsSync["found"] + $groupsSync["new"] + $groupsSync["update"]);
         asort($groupsToSyncMembership);
-//pre($usersSync,1);
-//pre($usersToSyncMembership);
-//pre($groupsToSyncMembership);
-//pre($ldapGroupsSafe);
+
         $this->logger->notice("Synchronising Gitlab group members with directory group members...");
         foreach ($groupsToSyncMembership as $gitlabGroupFullPath => $gitlabGroup) {
 
