@@ -304,7 +304,11 @@ class Config
                 ))) {
                     $addProblem("error", "ldap->queries->userEmailAttribute not specified.");
                 }
-
+                if (!isset($config["ldap"]["queries"]["userSshKeyAttribute"])) {
+                    $addProblem("warning", "ldap->queries->userSshKeyAttribute missing.");
+                } elseif (!$config["ldap"]["queries"]["userSshKeyAttribute"] = trim($config["ldap"]["queries"]["userSshKeyAttribute"])) {
+                    $addProblem("warning", "ldap->queries->userSshKeyAttribute not specified.");
+                }
                 if (!isset($config["ldap"]["queries"]["groupDn"])) {
                     $addProblem("error", "ldap->queries->groupDn missing.");
                 } elseif (!($config["ldap"]["queries"]["groupDn"] = trim($config["ldap"]["queries"]["groupDn"]))) {

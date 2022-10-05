@@ -333,6 +333,7 @@ class LdapSyncCommand extends Command
             $this->config["ldap"]["queries"]["userNameAttribute"],
             $this->config["ldap"]["queries"]["userEmailAttribute"],
             $this->config["ldap"]["queries"]["userLdapAdminAttribute"],
+            $this->config["ldap"]["queries"]["userSshKeyAttribute"],
         ];
 
         $this->logger->debug("Retrieving users with: \n\tbase: {base}\n\tfilter: {filter}\n\tattribute: {attribute}", [
@@ -354,18 +355,18 @@ class LdapSyncCommand extends Command
         $ldapNameAttribute = strtolower($this->config["ldap"]["queries"]["userNameAttribute"]);
         $ldapEmailAttribute = strtolower($this->config["ldap"]["queries"]["userEmailAttribute"]);
         $ldapAdminAttribute = strtolower($this->config["ldap"]["queries"]["userLdapAdminAttribute"]);
+        $ldapSshKeyAttribute = strtolower($this->config["ldap"]["queries"]["userSshKeyAttribute"]);
 
         if (is_array($ldapUsers = @ldap_get_entries($ldap, $ldapUsersQuery)) && is_iterable($ldapUsers)) {
             if (($ldapUsersNum = count($ldapUsers)) >= 1) {
                 $this->logger->notice("{userCount} directory user(s) found.", ["userCount" => $ldapUsersNum]);
-
                 foreach ($ldapUsers as $i => $ldapUser) {
                     if (!is_int($i)) {
                         continue;
                     }
                     $n = $i + 1;
 
-                    $this->logger->debug(sprintf("User: %s", print_r($ldapUser, 1)));
+//                    $this->logger->debug(sprintf("User: %s", print_r($ldapUser, 1)));
                     if (!is_array($ldapUser)) {
                         $this->logger->error(sprintf("User #%d: Not an array.", $n));
                         continue;
@@ -501,6 +502,18 @@ class LdapSyncCommand extends Command
                         continue;
                     }
 
+                    $ldapUserSshKeys = null;
+                    if ($ldapSshKeyAttribute && isset($ldapUser[$ldapSshKeyAttribute])) {
+
+                        $ldapUserSshKeys = [];
+                        foreach ($ldapUser[$ldapSshKeyAttribute] as $key) {
+                            if (substr($key, 0, 8) != 'ssh-rsa ') {
+                                continue;
+                            }
+                            $fingerprint = $this->getFingerprint($key);
+                            $ldapUserSshKeys[] = ["key" => $key, "fingerprint" => $fingerprint];
+                        }
+                    }
                     if ($this->in_array_i($ldapUserName, $this->config["gitlab"]["options"]["userNamesToIgnore"])) {
                         $this->logger->info(sprintf("User \"%s\" in ignore list.", $ldapUserName));
                         continue;
@@ -527,6 +540,7 @@ class LdapSyncCommand extends Command
                         "email" => $ldapUserEmail,
                         "isAdmin" => $ldapAdmin,
                         "isExternal" => false,
+                        "sshKeys" => $ldapUserSshKeys,
                     ];
                 }
                 ksort($users);
@@ -921,8 +935,8 @@ class LdapSyncCommand extends Command
                 }
 
                 $this->logger->info(sprintf("Found Gitlab user #%d \"%s\".", $gitlabUserId, $gitlabUserName));
-                if (isset($usersSync["found"][$gitlabUserId]) || $this->in_array_i(
-                        $gitlabUserName,
+                if (isset($usersSync["found"][$gitlabUserId]) || $this->recursive_find_pair(
+                        ["name" => $gitlabUserName],
                         $usersSync["found"]
                     )) {
                     $this->logger->warning(
@@ -930,8 +944,19 @@ class LdapSyncCommand extends Command
                     );
                     continue;
                 }
-
-                $usersSync["found"][$gitlabUserId] = $gitlabUserName;
+                $gitlabUserKeys = $gitlab->users()->userKeys($gitlabUserId);
+                $userKeys = [];
+                if (!empty($gitlabUserKeys)) {
+                    foreach ($gitlabUserKeys as $key) {
+                        if (substr($key["key"], 0, 8) != 'ssh-rsa ') {
+                            continue;
+                        }
+                        $fingerprint = $this->getFingerprint($key["key"]);
+                        $userKeys[] = ["key" => $key["key"], "id" => $key["id"], "fingerprint" => $fingerprint];
+                    }
+                }
+                $gitlabUser["keys"] = $userKeys;
+                $usersSync["found"][$gitlabUserId] = $gitlabUser;
             }
         }
 
@@ -952,64 +977,25 @@ class LdapSyncCommand extends Command
             }
 
             $gitlabUserName = trim($ldapUserName);
-            if ($this->in_array_i($gitlabUserName, $usersSync["found"])) {
+            if ($this->recursive_find_pair(["username" => $gitlabUserName], $usersSync["found"])) {
                 continue;
             }
 
             $this->logger->info(sprintf("Creating Gitlab user \"%s\" [%s].", $gitlabUserName, $ldapUserDetails["dn"]));
             $gitlabUser = null;
 
-            $gitlabUserPassword = $this->generateRandomPassword(12);
-            $this->logger->debug(
-                sprintf(
-                    "Password for Gitlab user \"%s\" [%s] will be: %s",
-                    $gitlabUserName,
-                    $ldapUserDetails["dn"],
-                    $gitlabUserPassword
-                )
+            $gitlabUser = $this->create_user(
+                $gitlabUserName,
+                $ldapUserDetails,
+                $gitlab,
+                $gitlabConfig["ldapServerName"]
             );
 
-            try {
-                !$this->dryRun ? ($gitlabUser = $gitlab->users()->create(
-                    $ldapUserDetails["email"],
-                    $gitlabUserPassword,
-                    [
-                        "username" => $gitlabUserName,
-                        "reset_password" => false,
-                        "name" => $ldapUserDetails["fullName"],
-                        "extern_uid" => $ldapUserDetails["dn"],
-                        "provider" => $gitlabConfig["ldapServerName"],
-                        "email" => $ldapUserDetails["email"],
-                        "admin" => $ldapUserDetails["isAdmin"],
-                        "can_create_group" => $ldapUserDetails["isAdmin"],
-                        "skip_confirmation" => true,
-                        "external" => $ldapUserDetails["isExternal"],
-                    ]
-                )) : $this->logger->warning("Operation skipped due to dry run.");
-            } catch (Exception $e) {
-                // Permit continue when user email address already used by another account
-                if ("Email has already been taken" === $e->getMessage()) {
-                    $this->logger->error(
-                        sprintf(
-                            "Gitlab user \"%s\" [%s] was not created, email address already used by another account.",
-                            $gitlabUserName,
-                            $ldapUserDetails["dn"]
-                        )
-                    );
-                }
-
-                if ($this->continueOnFail) {
-                    $this->gitlabApiCoolDown();
-                    continue;
-                }
-
-                throw $e;
-            }
 
             $gitlabUserId = (is_array($gitlabUser) && isset($gitlabUser["id"]) && is_int(
                     $gitlabUser["id"]
                 )) ? $gitlabUser["id"] : sprintf("dry:%s", $ldapUserDetails["dn"]);
-            $usersSync["new"][$gitlabUserId] = $gitlabUserName;
+            $usersSync["new"][$gitlabUserId] = $gitlabUser;
 
             $this->gitlabApiCoolDown();
         }
@@ -1019,7 +1005,8 @@ class LdapSyncCommand extends Command
 
         // Disable Gitlab users of which don't exist in directory
         $this->logger->notice("Disabling Gitlab users of which don't exist in directory...");
-        foreach ($usersSync["found"] as $gitlabUserId => $gitlabUserName) {
+        foreach ($usersSync["found"] as $gitlabUserId => $gitlabUser) {
+            $gitlabUserName = $gitlabUser["username"];
             if ($this->in_array_i($gitlabUserName, $this->getBuiltInUserNames())) {
                 $this->logger->info(sprintf("Gitlab built-in %s user will be ignored.", $gitlabUserName));
                 continue;
@@ -1035,7 +1022,6 @@ class LdapSyncCommand extends Command
             }
 
             $this->logger->warning(sprintf("Disabling Gitlab user #%d \"%s\".", $gitlabUserId, $gitlabUserName));
-            $gitlabUser = null;
 
             !$this->dryRun ? ($gitlab->users()->block($gitlabUserId)) : $this->logger->warning(
                 "Operation skipped due to dry run."
@@ -1046,7 +1032,7 @@ class LdapSyncCommand extends Command
                 "external" => true,
             ])) : $this->logger->warning("Operation skipped due to dry run.");
 
-            $usersSync["extra"][$gitlabUserId] = $gitlabUserName;
+            $usersSync["extra"][$gitlabUserId] = ["name" => $gitlabUserName];
 
             $this->gitlabApiCoolDown();
         }
@@ -1058,7 +1044,8 @@ class LdapSyncCommand extends Command
 
         // Update users of which were already in both Gitlab and the directory
         $this->logger->notice("Updating users of which were already in both Gitlab and the directory...");
-        foreach ($usersSync["found"] as $gitlabUserId => $gitlabUserName) {
+        foreach ($usersSync["found"] as $gitlabUserId => $gitlabUser) {
+            $gitlabUserName = $gitlabUser["username"];
             if (!empty($usersSync["new"][$gitlabUserId]) || !empty($usersSync["extra"][$gitlabUserId])) {
                 continue;
             }
@@ -1080,33 +1067,9 @@ class LdapSyncCommand extends Command
                 );
             }
 
-            $this->logger->info(sprintf("Updating Gitlab user #%d \"%s\".", $gitlabUserId, $gitlabUserName));
-            $gitlabUser = null;
+            $this->update_user($gitlabUser, $ldapUsers, $gitlab, $gitlabConfig["ldapServerName"]);
 
-            if (!isset($ldapUsers[$gitlabUserName]) || !is_array($ldapUsers[$gitlabUserName]) || count(
-                    $ldapUsers[$gitlabUserName]
-                ) < 4) {
-                $this->logger->info(sprintf("Gitlab user \"%s\" has no LDAP details available.", $gitlabUserName));
-                continue;
-            }
-            $ldapUserDetails = $ldapUsers[$gitlabUserName];
-
-            !$this->dryRun ? ($gitlab->users()->update($gitlabUserId, [
-                // "username"          => $gitlabUserName,
-                // No point updating that. ^
-                // If the UID changes so will that bit of the DN anyway, so this can't be detected with a custom attribute containing the Gitlab user ID written back to user's LDAP object.
-                "reset_password" => false,
-                "name" => $ldapUserDetails["fullName"],
-                "extern_uid" => $ldapUserDetails["dn"],
-                "provider" => $gitlabConfig["ldapServerName"],
-                "email" => $ldapUserDetails["email"],
-                "admin" => $ldapUserDetails["isAdmin"],
-                "can_create_group" => $ldapUserDetails["isAdmin"],
-                "skip_confirmation" => true,
-                "external" => $ldapUserDetails["isExternal"],
-            ])) : $this->logger->warning("Operation skipped due to dry run.");
-
-            $usersSync["update"][$gitlabUserId] = $gitlabUserName;
+            $usersSync["update"][$gitlabUserId] = ["name" => $gitlabUserName];
 
             $this->gitlabApiCoolDown();
         }
@@ -1183,6 +1146,7 @@ class LdapSyncCommand extends Command
             $parentId = null;
             // Check if we might have a subgroup:
             if (strpos($ldapGroupName, "/")) {
+                // todo: add sub subgroup support (parent/child/.../...)
                 // get parent id
                 list($parent, $child) = explode("/", $ldapGroupName);
                 if ($parent && isset($groupsSync["found"][strtolower($parent)])) {
@@ -1410,6 +1374,7 @@ class LdapSyncCommand extends Command
         asort($usersToSyncMembership);
         $groupsToSyncMembership = ($groupsSync["found"] + $groupsSync["new"] + $groupsSync["update"]);
         asort($groupsToSyncMembership);
+//pre($usersSync,1);
 //pre($usersToSyncMembership);
 //pre($groupsToSyncMembership);
 //pre($ldapGroupsSafe);
@@ -1422,7 +1387,8 @@ class LdapSyncCommand extends Command
 
 
             $membersOfThisGroup = [];
-            foreach ($usersToSyncMembership as $gitlabUserId => $gitlabUserName) {
+            foreach ($usersToSyncMembership as $gitlabUserId => $gitlabUser) {
+                $gitlabUserName = $gitlabUser["username"];
                 if (!isset($ldapGroupsSafe[$gitlabGroupFullPath]) || !is_array($ldapGroupsSafe[$gitlabGroupFullPath])) {
                     $this->logger->warning(
                         sprintf(
@@ -1869,6 +1835,220 @@ class LdapSyncCommand extends Command
 
         return true;
     }
+
+    /**
+     * @param $key
+     *
+     * @return string
+     */
+    private function getFingerprint($key): string
+    {
+        $content = explode(' ', $key, 3);
+
+        return join(':', str_split(md5(base64_decode($content[1])), 2));
+    }
+
+    /**
+     * @param string $gitlabUserName
+     * @param        $ldapUserDetails
+     * @param Client $gitlab
+     * @param        $ldapServerName
+     *
+     * @return mixed
+     * @throws Exception
+     */
+    private function create_user(string $gitlabUserName, $ldapUserDetails, Client $gitlab, $ldapServerName)
+    {
+        $gitlabUser = null;
+        $gitlabUserPassword = $this->generateRandomPassword(12);
+        $this->logger->debug(
+            sprintf(
+                "Password for Gitlab user \"%s\" [%s] will be: %s",
+                $gitlabUserName,
+                $ldapUserDetails["dn"],
+                $gitlabUserPassword
+            )
+        );
+
+        try {
+            !$this->dryRun ? ($gitlabUser = $gitlab->users()->create(
+                $ldapUserDetails["email"],
+                $gitlabUserPassword,
+                [
+                    "username" => $gitlabUserName,
+                    "reset_password" => false,
+                    "name" => $ldapUserDetails["fullName"],
+                    "extern_uid" => $ldapUserDetails["dn"],
+                    "provider" => $ldapServerName,
+                    "email" => $ldapUserDetails["email"],
+                    "admin" => $ldapUserDetails["isAdmin"],
+                    "can_create_group" => $ldapUserDetails["isAdmin"],
+                    "skip_confirmation" => true,
+                    "external" => $ldapUserDetails["isExternal"],
+                ]
+            )) : $this->logger->warning("Operation skipped due to dry run.");
+        } catch (Exception $e) {
+            // Permit continue when user email address already used by another account
+            if ("Email has already been taken" === $e->getMessage()) {
+                $this->logger->error(
+                    sprintf(
+                        "Gitlab user \"%s\" [%s] was not created, email address already used by another account.",
+                        $gitlabUserName,
+                        $ldapUserDetails["dn"]
+                    )
+                );
+            }
+
+            if ($this->continueOnFail) {
+                $this->gitlabApiCoolDown();
+
+                return null;
+            }
+
+            throw $e;
+        }
+
+        $this->update_ssh_key($ldapUserDetails, $gitlabUser, $gitlab);
+
+        return $gitlabUser;
+    }
+
+
+    /**
+     * @param array  $gitlabUser
+     * @param array  $ldapUsers
+     * @param Client $gitlab
+     * @param        $ldapServerName
+     */
+    private function update_user(
+        array $gitlabUser,
+        array $ldapUsers,
+        Client $gitlab,
+        $ldapServerName
+    ): void {
+        $this->logger->info(sprintf("Updating Gitlab user #%d \"%s\".", $gitlabUser["id"], $gitlabUser["username"]));
+
+        if (!isset($ldapUsers[$gitlabUser["username"]]) || !is_array($ldapUsers[$gitlabUser["username"]]) || count(
+                $ldapUsers[$gitlabUser["username"]]
+            ) < 5) {
+            $this->logger->info(sprintf("Gitlab user \"%s\" has no LDAP details available.", $gitlabUser["username"]));
+
+            return;
+        }
+        $ldapUserDetails = $ldapUsers[$gitlabUser["username"]];
+
+        try {
+            !$this->dryRun ? ($gitlab->users()->update($gitlabUser["id"], [
+                // "username"          => $gitlabUserName,
+                // No point updating that. ^
+                // If the UID changes so will that bit of the DN anyway, so this can't be detected with a custom attribute containing the Gitlab user ID written back to user's LDAP object.
+                "reset_password" => false,
+                "name" => $ldapUserDetails["fullName"],
+                "extern_uid" => $ldapUserDetails["dn"],
+                "provider" => $ldapServerName,
+                "email" => $ldapUserDetails["email"],
+                "admin" => $ldapUserDetails["isAdmin"],
+                "can_create_group" => $ldapUserDetails["isAdmin"],
+                "skip_confirmation" => true,
+                "external" => $ldapUserDetails["isExternal"],
+            ])) : $this->logger->warning("Operation skipped due to dry run.");
+        } catch (Exception $e) {
+            // do nothing
+        }
+
+        $this->update_ssh_key($ldapUserDetails, $gitlabUser, $gitlab);
+
+    }
+
+    /**
+     * @param array  $ldapUserDetails
+     * @param array  $gitlabUser
+     * @param Client $gitlab
+     *
+     */
+    private function update_ssh_key(array $ldapUserDetails, array $gitlabUser, Client $gitlab)
+    {
+        // check if we have ldap keys and need to add
+        if ($ldapUserDetails["sshKeys"] && count($ldapUserDetails["sshKeys"]) > 0) {
+            foreach ($ldapUserDetails["sshKeys"] as $sshKey) {
+                //check if key already exists
+                if (!is_array($gitlabUser["keys"]) || count($gitlabUser["keys"]) < 1 || !$this->recursive_find_pair(
+                        ["fingerprint" => $sshKey["fingerprint"]],
+                        $gitlabUser["keys"]
+                    )) {
+
+                    $this->add_ssh_key($gitlabUser, $sshKey, $gitlab, $ldapUserDetails["email"]);
+                }
+            }
+        }
+
+        //remove gitlab keys not in ldap
+        if ($gitlabUser["keys"] && count($gitlabUser["keys"]) > 0) {
+            foreach ($gitlabUser["keys"] as $sshKey) {
+                //check if key already exists
+                if (!is_array($ldapUserDetails["sshKeys"]) || count($ldapUserDetails["sshKeys"]) < 1 || !$this->recursive_find_pair(
+                        ["fingerprint" => $sshKey["fingerprint"]],
+                        $ldapUserDetails["sshKeys"]
+                    )) {
+
+                    $this->remove_ssh_key($gitlabUser, $sshKey, $gitlab);
+                }
+            }
+        }
+    }
+
+    /**
+     * @param array  $gitlabUser
+     * @param array  $sshKey
+     * @param Client $gitlab
+     * @param string $email
+     *
+     * @return void
+     */
+    private function add_ssh_key(array $gitlabUser, array $sshKey, Client $gitlab, string $email)
+    {
+        $this->logger->debug(
+            sprintf(
+                "Adding SSH key for Gitlab user \"%s\" with fingerprint: [%s] ",
+                $gitlabUser["username"],
+                $sshKey["fingerprint"]
+            )
+        );
+        try {
+            !$this->dryRun ? ($gitlab->users()->createKeyForUser(
+                $gitlabUser["id"],
+                $email,
+                $sshKey["key"]
+            )) : $this->logger->warning("Operation skipped due to dry run.");
+        } catch (Exception $e) {
+            // do nothing
+        }
+
+    }
+
+    /**
+     * @param array  $gitlabUser
+     * @param array  $sshKey
+     * @param Client $gitlab
+     */
+    private function remove_ssh_key(array $gitlabUser, array $sshKey, Client $gitlab): void
+    {
+        $this->logger->debug(
+            sprintf(
+                "Removing SSH key for Gitlab user \"%s\" with fingerprint: [%s] ",
+                $gitlabUser["username"],
+                $sshKey["fingerprint"]
+            )
+        );
+        try {
+            !$this->dryRun ? ($gitlab->users()->removeUserKey(
+                $gitlabUser["id"],
+                $sshKey["id"]
+            )) : $this->logger->warning("Operation skipped due to dry run.");
+        } catch (Exception $e) {
+            // do nothing
+        }
+    }
 }
 
 /**
@@ -1877,7 +2057,7 @@ class LdapSyncCommand extends Command
  * @param string|array $strPre
  * @param bool         $blnExit
  */
-function pre($strPre, bool $blnExit)
+function pre($strPre, bool $blnExit = false)
 {
     echo "\n";
     print_r($strPre);

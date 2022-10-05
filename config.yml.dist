@@ -24,6 +24,7 @@ ldap:
         userNameAttribute:              "cn"
         userEmailAttribute:             "mail"
         userLdapAdminAttribute:         "jcLdapAdmin"
+        userSshKeyAttribute:            "sshKey"
 
         groupDn:                        ~
         groupFilter:                    "(objectClass=groupOfUniqueNames)"
